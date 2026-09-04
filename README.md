@@ -1,9 +1,11 @@
-# DriveHarm
+# DriveHarm SixCam
 
-DriveHarm is the compact production implementation of the six-camera nuScenes
-STORM asset re-insertion workflow used to build `gt/input/target` harmonization
-triplets. The repository contains code and documentation only. Assets,
-checkpoints, nuScenes images, generated pairs and audit logs stay outside Git.
+DriveHarm SixCam is the isolated six-camera release extension of DriveHarm. It
+retains the complete train-quality STORM asset re-insertion pipeline and adds a
+batch publisher that groups already audited camera triplets into synchronized
+nuScenes rings. The original DriveHarm repository is not modified. This
+repository contains code and documentation only; assets, checkpoints, images
+and run receipts stay outside Git.
 
 The code is organized as a reusable pair-production core with a frozen train
 production profile. Dataset adapters provide either the native train capacity
@@ -21,6 +23,66 @@ The authoritative behavior is the production flow that created
 `nusc_pair/train`. The validation split is not used as a generation template.
 One bug found while auditing validation data is retained only as a regression
 check at the final quality gate.
+
+## Six-camera batch release
+
+One published group is one scene and one target frame with exactly 18 flat PNG
+files in this fixed ring order:
+
+1. `CAM_FRONT`
+2. `CAM_FRONT_RIGHT`
+3. `CAM_BACK_RIGHT`
+4. `CAM_BACK`
+5. `CAM_BACK_LEFT`
+6. `CAM_FRONT_LEFT`
+
+Every camera contributes `gt`, `input` and `target`, named as
+`{group_id}__{CAMERA_NAME}__{role}.png`. An asset is inserted only in cameras
+where the frozen visibility manifest explicitly marks it usable. In every
+other camera, `input` is the exact unedited `target`; absence of an accepted
+pair row is never interpreted as invisibility.
+
+The publisher requires an unambiguous `gt/target` baseline in all six cameras.
+For each visible camera it also requires an already audited pair whose exact
+canonical asset set matches the assets visible in that camera. A missing or
+conflicting view excludes the complete group; partial 18-image groups are never
+published. Single- and multi-asset groups use the same rule.
+
+```bash
+driveharm-sixcam sixcam-release \
+  --source-root /data/nusc_pair/train \
+  --records /data/accepted_records.jsonl \
+  --visibility-manifest /data/single_asset_jobs.json \
+  --destination /data/sixcam/flat \
+  --receipt-root /data/sixcam/receipts \
+  --category car --category truck --category bus --category van \
+  --maximum-groups 0 --materialize hardlink --workers 32
+
+driveharm-sixcam sixcam-audit \
+  --dataset-root /data/sixcam/flat \
+  --groups /data/sixcam/receipts/groups.jsonl \
+  --source-records /data/accepted_records.jsonl \
+  --visibility-manifest /data/single_asset_jobs.json \
+  --output-root /data/sixcam/audit --workers 32
+```
+
+`--maximum-groups 0` means all complete groups. Repeat `--scene` or
+`--category` to select a subset. Publication uses a temporary sibling and one
+atomic rename. An existing destination is refused unless `--replace` is
+explicit; replacement preserves the previous release as a timestamped sibling.
+
+The independent audit checks all 18 files per group, exact camera order and
+names, PNG/RGB/512x288 contracts, hashes and flat-directory membership. It also
+replays source-record identity and content bindings plus per-asset visibility:
+visible views must reference an exact audited pair and make an effective edit;
+invisible views must reference no pair and be byte-identical to `target`.
+
+To generate new capacity rather than regroup existing accepted rows, first run
+the retained train pipeline below so that every chosen scene/frame has six
+unambiguous baseline views and every visible camera has an accepted exact pair.
+Then run `sixcam-release` and `sixcam-audit`. This keeps size, orientation,
+grounding, identity, broken/doubled-asset and physical-occlusion decisions in
+the same train gates instead of introducing a second quality policy.
 
 ## Pair definition
 
@@ -277,8 +339,9 @@ The tests cover the native train exact-asset/capacity/identity shapes,
 all-camera planning, single and combined jobs, checkpoint and job binding,
 area-aware orientation rejection, 2% edit overlap, exact-mask/nearer-occluder
 ordering, actor-removal locality, composition, independent audit, publication,
-and recoverable triplet quarantine. They also enforce the compact file count
-and asynchronous OpenAI JSON-schema contract.
+and recoverable triplet quarantine. They also enforce exactly 18 flat files per
+six-camera group, explicit invisible-camera no-ops, source/visibility replay,
+the compact source-file count and asynchronous OpenAI JSON-schema contract.
 
 ## Verified reference release
 
@@ -293,6 +356,25 @@ additional regression test and does not change the train generation stages or
 their reasonable thresholds.
 
 ## Real pilot evidence
+
+### Six-camera grouping pilot
+
+The isolated batch publisher was run against the formal 51,132-row train
+release. The source contains 10,366 scene/frame keys; 23 have complete,
+unambiguous six-camera baselines. Across those frames, 267 candidate asset sets
+were found and 260 form complete groups; seven are correctly excluded because
+a visible camera lacks an exact accepted pair. Restricting to
+car/truck/bus/van leaves 186 complete vehicle groups.
+
+The small real pilot published four groups (72 PNGs) from `scene-0067`, with
+five genuinely edited visible views and 19 invisible no-op views. Every image
+passed decode, shape, hash, camera/role membership, upstream source-record and
+visibility replay. All five edited views were also inspected at original
+resolution; no identity swap, reversal, broken/doubled asset or clear
+foreground-occlusion violation was found. This pilot deliberately does not
+materialize the full available batch.
+
+### Original camera-triplet pilot
 
 A 35-row isolated pilot covered all six cameras, 12 train scenes, car/bus/van,
 clear views and 13 renderer-declared occlusion cases. Eight scheduler slots

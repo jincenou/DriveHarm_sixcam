@@ -705,7 +705,7 @@ class PipelineTests(unittest.TestCase):
         python_files = sorted(root.glob("driveharm/*.py")) + sorted(
             root.glob("tests/*.py")
         )
-        self.assertLessEqual(len(python_files), 11)
+        self.assertLessEqual(len(python_files), 13)
         source = "\n".join(path.read_text(encoding="utf-8") for path in python_files)
         self.assertIn("AsyncOpenAI", source)
         self.assertIn("await client.chat.completions.create", source)

@@ -15,6 +15,7 @@ from .planning import build_plan
 from .release import publish_release, quarantine_triplets
 from .render import render_shards
 from .review import review_manifest
+from .sixcam import audit_sixcam_release, build_sixcam_release
 
 
 def _gpus(value: str) -> tuple[int, ...]:
@@ -226,6 +227,27 @@ def parser() -> argparse.ArgumentParser:
     release.add_argument("--replace", action="store_true")
     release.add_argument("--workers", type=int, default=32)
 
+    ring = sub.add_parser("sixcam-release")
+    ring.add_argument("--source-root", type=Path, required=True)
+    ring.add_argument("--records", type=Path, required=True)
+    ring.add_argument("--visibility-manifest", type=Path, required=True)
+    ring.add_argument("--destination", type=Path, required=True)
+    ring.add_argument("--receipt-root", type=Path, required=True)
+    ring.add_argument("--maximum-groups", type=int, default=0)
+    ring.add_argument("--scene", action="append", default=[])
+    ring.add_argument("--category", action="append", default=[])
+    ring.add_argument("--materialize", choices=("hardlink", "copy"), default="hardlink")
+    ring.add_argument("--replace", action="store_true")
+    ring.add_argument("--workers", type=int, default=32)
+
+    ring_audit = sub.add_parser("sixcam-audit")
+    ring_audit.add_argument("--dataset-root", type=Path, required=True)
+    ring_audit.add_argument("--groups", type=Path, required=True)
+    ring_audit.add_argument("--source-records", type=Path, required=True)
+    ring_audit.add_argument("--visibility-manifest", type=Path, required=True)
+    ring_audit.add_argument("--output-root", type=Path, required=True)
+    ring_audit.add_argument("--workers", type=int, default=32)
+
     run = sub.add_parser("run")
     run.add_argument("--asset-post", type=Path, required=True)
     run.add_argument("--observations", type=Path, required=True)
@@ -313,6 +335,29 @@ def main() -> int:
             args.receipt_root,
             args.materialize,
             args.replace,
+            args.workers,
+        )
+    elif args.command == "sixcam-release":
+        result = build_sixcam_release(
+            args.source_root,
+            args.records,
+            args.visibility_manifest,
+            args.destination,
+            args.receipt_root,
+            args.maximum_groups,
+            args.scene,
+            args.category,
+            args.materialize,
+            args.replace,
+            args.workers,
+        )
+    elif args.command == "sixcam-audit":
+        result = audit_sixcam_release(
+            args.dataset_root,
+            args.groups,
+            args.source_records,
+            args.visibility_manifest,
+            args.output_root,
             args.workers,
         )
     else:

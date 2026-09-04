@@ -3,7 +3,7 @@ requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "driveharm"
+name = "driveharm-sixcam"
 version = "0.1.0"
 description = "Audited six-camera STORM asset re-insertion pair production"
 requires-python = ">=3.10"
@@ -11,6 +11,7 @@ dependencies = ["numpy>=1.23", "Pillow>=10", "openai>=2.0"]
 
 [project.scripts]
 driveharm = "driveharm.cli:main"
+driveharm-sixcam = "driveharm.cli:main"
 driveharm-storm-renderer = "driveharm.storm_adapter:main"
 
 [tool.setuptools]
