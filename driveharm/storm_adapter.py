@@ -218,14 +218,19 @@ def _geometry(row: dict[str, Any], occluded: bool) -> dict[str, Any]:
     }
 
 
-def _legacy_index(manifest: dict[str, Any]) -> dict[tuple[str, str, int, str], dict[str, Any]]:
+def _legacy_index(
+    manifest: dict[str, Any],
+) -> dict[tuple[str, str, int, str], dict[str, Any]]:
     result: dict[tuple[str, str, int, str], dict[str, Any]] = {}
     for job in manifest.get("jobs") or []:
+        context = str(job.get("multi_case_id") or "")
+        if not context:
+            raise ValueError("legacy render opportunity has no multi_case_id")
         for raw, usable in (job.get("target_usable_by_frame_camera") or {}).items():
             if not usable:
                 continue
             frame, camera = raw.split(":c", 1)
-            key = (job["scene_name"], job["obj_id"], int(frame), camera)
+            key = (context, job["obj_id"], int(frame), camera)
             if key in result:
                 raise ValueError(f"ambiguous legacy render opportunity: {key}")
             result[key] = job
@@ -268,9 +273,19 @@ def _run_legacy(
     ]
     environment = dict(os.environ)
     environment.pop("CUDA_VISIBLE_DEVICES", None)
-    subprocess.run(
-        command, cwd=profile["repo_root"], env=environment, check=True
+    environment["PATH"] = os.pathsep.join(
+        [str(Path(profile["python"]).resolve(strict=True).parent), environment.get("PATH", "")]
     )
+    completed = subprocess.run(
+        command, cwd=profile["repo_root"], env=environment, check=False
+    )
+    # The frozen batch controller returns one when a bounded subset of jobs
+    # fails after writing per-job state.  Preserve those failures for group
+    # quarantine; any other exit code is an orchestration failure.
+    if completed.returncode not in {0, 1}:
+        raise RuntimeError(
+            f"legacy renderer failed systemically with exit {completed.returncode}"
+        )
 
 
 def _legacy_result_path(
@@ -287,16 +302,38 @@ def _legacy_result_path(
 
 def adapt(args: argparse.Namespace) -> None:
     profile = _load(args.profile.resolve(strict=True))
+    required_profile = (
+        "python",
+        "repo_root",
+        "job_root",
+        "data_root",
+        "annotation_list",
+        "raw_nuscenes_root",
+        "storm_checkpoint",
+        "cvac_checkpoint",
+        "dcn_checkpoint",
+    )
+    missing_profile = [key for key in required_profile if not profile.get(key)]
+    if missing_profile:
+        raise ValueError(
+            "renderer profile is missing required fields: "
+            + ", ".join(missing_profile)
+        )
+    for key in required_profile:
+        Path(str(profile[key])).resolve(strict=True)
     jobs = list(iter_jsonl(args.jobs.resolve(strict=True)))
     manifest = _load(Path(profile["job_root"]) / "single_asset_jobs.json")
     index = _legacy_index(manifest)
     bindings: dict[str, list[dict[str, Any]]] = {}
     selected_indices: set[int] = set()
     for job in jobs:
-        key_prefix = (job["scene_name"], int(job["frame_index"]), str(job["camera_id"]))
+        context = str(job.get("context_id") or job.get("window_id") or "")
+        if not context:
+            raise ValueError(f"render job has no context identity: {job['sample_id']}")
+        key_suffix = (int(job["frame_index"]), str(job["camera_id"]))
         matched = []
         for asset in job["assets"]:
-            legacy = index.get((key_prefix[0], asset["obj_id"], key_prefix[1], key_prefix[2]))
+            legacy = index.get((context, asset["obj_id"], *key_suffix))
             if legacy is None:
                 raise ValueError(f"no legacy STORM opportunity for {job['sample_id']}:{asset['obj_id']}")
             binding = legacy["exact_asset_binding"]
@@ -330,6 +367,35 @@ def adapt(args: argparse.Namespace) -> None:
     }
     results: list[dict[str, Any]] = []
     for job in jobs:
+        missing = [
+            str(_legacy_result_path(args.output_root, legacy))
+            for legacy in bindings[job["sample_id"]]
+            if not _legacy_result_path(args.output_root, legacy).is_file()
+        ]
+        if missing:
+            result = {
+                "schema_version": 1,
+                "status": "failed",
+                "job_kind": job.get("job_kind"),
+                "sample_id": job["sample_id"],
+                "job_sha256": job["job_sha256"],
+                "split": job.get("split"),
+                "context_id": job.get("context_id"),
+                "scene_name": job["scene_name"],
+                "frame_index": job["frame_index"],
+                "camera_id": str(job["camera_id"]),
+                "selected_obj_ids": list(job["selected_obj_ids"]),
+                "checkpoint_sha256": checkpoint_hashes,
+                "error": {
+                    "type": "LegacyRenderResultMissing",
+                    "message": f"{len(missing)} bound legacy result(s) missing",
+                    "examples": missing[:3],
+                },
+            }
+            result["result_sha256"] = canonical_sha256(result)
+            results.append(result)
+            print(f"visible backfill {job['sample_id']} failed", flush=True)
+            continue
         sample_root = args.output_root / "converted" / job["sample_id"]
         flat_rows: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] = []
         for legacy in bindings[job["sample_id"]]:
@@ -486,6 +552,7 @@ def adapt(args: argparse.Namespace) -> None:
             "asset_layers": layers,
         }
         results.append(result)
+        print(f"visible backfill {job['sample_id']} complete", flush=True)
     atomic_jsonl(args.results, results)
 
 

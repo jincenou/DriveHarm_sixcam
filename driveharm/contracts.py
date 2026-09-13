@@ -77,13 +77,27 @@ def atomic_json(path: Path, value: Any) -> None:
 
 
 def atomic_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
-    atomic_text(
-        path,
-        "".join(
-            json.dumps(row, ensure_ascii=False, sort_keys=True, allow_nan=False) + "\n"
-            for row in rows
-        ),
-    )
+    """Atomically write JSONL without materializing the manifest in memory."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, raw = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(raw)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            for row in rows:
+                stream.write(
+                    json.dumps(
+                        row,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        allow_nan=False,
+                    )
+                )
+                stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def indexed_rows(path: Path, key: str) -> dict[str, dict[str, Any]]:

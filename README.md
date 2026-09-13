@@ -2,10 +2,12 @@
 
 DriveHarm SixCam is the isolated six-camera release extension of DriveHarm. It
 retains the complete train-quality STORM asset re-insertion pipeline and adds a
-batch publisher that groups already audited camera triplets into synchronized
-nuScenes rings. The original DriveHarm repository is not modified. This
-repository contains code and documentation only; assets, checkpoints, images
-and run receipts stay outside Git.
+strict index, missing-camera STORM baseline renderer, synchronized ring
+publisher, and independent auditor. Already audited camera triplets are reused;
+missing cameras are rendered from the same frozen STORM/CVAC/DCN checkpoints.
+The original DriveHarm repository is not modified. This repository contains
+code and documentation only; assets, checkpoints, images and run receipts stay
+outside Git.
 
 The code is organized as a reusable pair-production core with a frozen train
 production profile. Dataset adapters provide either the native train capacity
@@ -42,10 +44,10 @@ where the frozen visibility manifest explicitly marks it usable. In every
 other camera, `input` is the exact unedited `target`; absence of an accepted
 pair row is never interpreted as invisibility.
 
-The publisher requires an unambiguous `gt/target` baseline in all six cameras.
-For each visible camera it also requires an already audited pair whose exact
-canonical asset set matches the assets visible in that camera. A missing or
-conflicting view excludes the complete group; partial 18-image groups are never
+The legacy publisher requires an unambiguous existing `gt/target` baseline in
+all six cameras. The strict production path below additionally renders missing
+baselines and missing visible-camera pairs. A missing, conflicting, or rejected
+view quarantines the complete group; partial 18-image groups are never
 published. Single- and multi-asset groups use the same rule.
 
 ```bash
@@ -83,6 +85,87 @@ unambiguous baseline views and every visible camera has an accepted exact pair.
 Then run `sixcam-release` and `sixcam-audit`. This keeps size, orientation,
 grounding, identity, broken/doubled-asset and physical-occlusion decisions in
 the same train gates instead of introducing a second quality policy.
+
+## Strict synchronized production
+
+`sixcam-index` reconstructs group identity from official split, scene,
+`sample_token`, target frame, STORM context, global asset union, per-camera
+visibility, instance token, PLY hash, exposure, and checkpoint hashes. Content
+verification is on by default and checks every source PNG as RGB 512x288 plus
+its recorded SHA-256. `--skip-content-verification` is development-only and its
+output is refused by the strict publisher and production controller.
+
+The 2026-09-13 read-only audit verified 51,132 train and 9,399 validation source
+triplets. Of these, 43,247 train and 8,762 validation asset groups have strict,
+unambiguous synchronized identity. There are 318 directly reusable train groups
+and no directly reusable validation groups. Expanding the remainder requires
+3,589 model-resident STORM context jobs covering 53,204 missing baseline views,
+plus 456 visible-camera train-parity backfills. Existing hash-valid triplets are
+never rendered again.
+
+Build one content-verified index per official split:
+
+```bash
+driveharm sixcam-index \
+  --split train \
+  --source-root /data/nusc_pair/train \
+  --records /data/train_release_records.jsonl \
+  --metadata /data/train_metadata.jsonl \
+  --visibility-manifest /data/train_single_asset_jobs.json \
+  --trajectory-plan /data/train_multiasset_plan.json \
+  --sample-data-table /data/nuScenes/v1.0-trainval/sample_data.json \
+  --official-scenes /data/official_scenes.json \
+  --render-contract /data/render_contract.json \
+  --output-root /run/index/train --workers 32
+```
+
+Repeat for validation with its own source records, visibility manifest, and
+trajectory plan. Passing both roots to `sixcam-pilot-plan` deterministically
+extracts a small, diverse real pilot, including train/validation, direct reuse,
+single/multi-asset groups, multi-camera visibility, and invisible no-op views:
+
+```bash
+driveharm sixcam-pilot-plan \
+  --index-root /run/index/train \
+  --index-root /run/index/val \
+  --output-root /run/pilot/plan \
+  --train-count 8 --val-count 4 --direct-reuse-count 2
+```
+
+After rendering the extracted baseline and visible manifests, compose visible
+results, publish to a non-formal pilot destination, independently audit it, and
+generate one 6x3 review sheet per group with `sixcam-review-sheets`. Failed
+views are not replaced to chase a target count: their whole group is recorded
+in quarantine and omitted.
+
+Full production is a resume-safe controller. It renders train baselines, then
+validation baselines, visible backfills, composition, staging publication, and
+an independent audit. The formal destination is absent until an atomic rename
+activates a completely audited release:
+
+```bash
+driveharm-sixcam-production \
+  --train-index /run/index/train \
+  --val-index /run/index/val \
+  --train-profile /run/config/train_renderer_profile.json \
+  --val-profile /run/config/val_renderer_profile.json \
+  --baseline-python /envs/storm/bin/python \
+  --visible-python /envs/storm/bin/python \
+  --render-contract /data/render_contract.json \
+  --work-root /run/full \
+  --destination /data/nusc_pair_6cam \
+  --receipt-root /run/full_receipts \
+  --gpus 0,1,2,3 --workers-per-gpu 1 \
+  --shards-per-worker 4 --visible-shards-per-worker 1 \
+  --publish-workers 32
+```
+
+Rerunning the same command reuses every fully signed shard. Bounded individual
+failures are signed and quarantine all dependent groups; a renderer crash,
+checkpoint mismatch, invalid contract, CUDA failure, Ninja failure, or OOM is
+systemic and stops the controller. Monitor `production_state.json`, the shard
+attempt directories, and GPU processes rather than relying on a launcher PID
+alone.
 
 ## Pair definition
 
@@ -342,6 +425,10 @@ ordering, actor-removal locality, composition, independent audit, publication,
 and recoverable triplet quarantine. They also enforce exactly 18 flat files per
 six-camera group, explicit invisible-camera no-ops, source/visibility replay,
 the compact source-file count and asynchronous OpenAI JSON-schema contract.
+Strict-production tests additionally cover official sample replay, cross-token
+rejection, width/length/height conversion, content-verified index enforcement,
+bounded baseline failures, context-specific legacy lookup, four-GPU controller
+routing, separate baseline/visible shard policies, and independent root audit.
 
 ## Verified reference release
 
@@ -356,6 +443,24 @@ additional regression test and does not change the train generation stages or
 their reasonable thresholds.
 
 ## Real pilot evidence
+
+### Strict missing-camera production pilot (2026-09-13)
+
+The strict pilot selected 12 groups across train and validation from the fully
+content-verified indices. It rendered ten missing STORM baseline contexts on
+GPU0-1 and two missing visible-camera pairs through the frozen train pipeline.
+Four groups were rejected as complete units by target-quality or geometry
+gates; no replacement groups were selected. The remaining eight groups (six
+train and two validation) published 144 flat PNGs. An independent second audit
+checked every logical file and passed with zero candidates, zero incomplete
+groups, and zero train/validation scene overlap. All eight native-cell 6x3
+review sheets were visually inspected; invisible cameras were exact no-ops and
+no systematic identity, orientation, grounding, or occlusion defect was found.
+
+The pilot also exposed and fixed two production-only contract errors before the
+full run: the legacy lookup key originally omitted STORM context identity, and
+official nuScenes width/length/height had to be converted to renderer
+length/width/height. Both are regression-tested.
 
 ### Six-camera grouping pilot
 

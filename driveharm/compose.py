@@ -444,6 +444,10 @@ def compose_results(results_path: Path, output_root: Path) -> dict[str, Any]:
                 "content_sha256": {
                     role: sha256_file(path) for role, path in destinations.items()
                 },
+                "render_lineage": {
+                    "job_sha256": result.get("job_sha256"),
+                    "checkpoint_sha256": result.get("checkpoint_sha256"),
+                },
             }
             record["record_sha256"] = canonical_sha256(record)
             accepted.append(record)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -17,6 +18,8 @@ from driveharm.planning import _window_selections, build_plan
 from driveharm.release import publish_release, quarantine_triplets
 import driveharm.render as render_module
 import driveharm.review as review_module
+import driveharm.sixcam_production as production_module
+from driveharm.storm_adapter import _legacy_index
 
 
 SIZE = (512, 288)
@@ -31,6 +34,33 @@ def save_mask(path: Path, value: np.ndarray) -> None:
 
 
 class PipelineTests(unittest.TestCase):
+    def test_legacy_render_lookup_is_context_specific(self) -> None:
+        opportunities = []
+        for index, context in enumerate(("scene-0001__w000010__aaa", "scene-0001__w000010__bbb")):
+            opportunities.append(
+                {
+                    "job_index": index,
+                    "multi_case_id": context,
+                    "scene_name": "scene-0001",
+                    "obj_id": "shared-object",
+                    "target_usable_by_frame_camera": {"000013:c0": True},
+                }
+            )
+        index = _legacy_index({"jobs": opportunities})
+        self.assertEqual(len(index), 2)
+        self.assertEqual(
+            index[("scene-0001__w000010__aaa", "shared-object", 13, "0")][
+                "job_index"
+            ],
+            0,
+        )
+        self.assertEqual(
+            index[("scene-0001__w000010__bbb", "shared-object", 13, "0")][
+                "job_index"
+            ],
+            1,
+        )
+
     def test_train_window_subsets_are_instance_safe_and_capped(self) -> None:
         def member(obj_id: str, instance: str) -> dict:
             return {"assets": [{"obj_id": obj_id, "instance_token": instance}]}
@@ -167,7 +197,7 @@ class PipelineTests(unittest.TestCase):
                 }
             render_contract = root / "render_contract.json"
             atomic_json(render_contract, {"artifacts": checkpoints})
-            calls = {"count": 0}
+            calls = {"count": 0, "paths": []}
 
             class FakeProcess:
                 returncode = 0
@@ -178,29 +208,38 @@ class PipelineTests(unittest.TestCase):
 
             async def create_process(*args, **kwargs):
                 calls["count"] += 1
+                calls["paths"].append(kwargs["env"]["PATH"])
                 arguments = list(args)
                 manifest = Path(arguments[arguments.index("--jobs") + 1])
                 results = Path(arguments[arguments.index("--results") + 1])
                 rows = [json.loads(line) for line in manifest.read_text().splitlines()]
+                result_rows = []
+                for row in rows:
+                    result = {
+                        **{
+                            key: row[key]
+                            for key in (
+                                "sample_id",
+                                "job_sha256",
+                                "selected_obj_ids",
+                                "camera_id",
+                                "frame_index",
+                            )
+                        },
+                        "status": "complete",
+                        "checkpoint_sha256": checkpoint_hashes,
+                    }
+                    if row["sample_id"] == "sample-5":
+                        result["status"] = "failed"
+                        result["error"] = {
+                            "type": "BoundedFixtureFailure",
+                            "message": "quarantine this one job",
+                        }
+                        result["result_sha256"] = canonical_sha256(result)
+                    result_rows.append(result)
                 atomic_jsonl(
                     results,
-                    [
-                        {
-                            **{
-                                key: row[key]
-                                for key in (
-                                    "sample_id",
-                                    "job_sha256",
-                                    "selected_obj_ids",
-                                    "camera_id",
-                                    "frame_index",
-                                )
-                            },
-                            "status": "complete",
-                            "checkpoint_sha256": checkpoint_hashes,
-                        }
-                        for row in rows
-                    ],
+                    result_rows,
                 )
                 return FakeProcess()
 
@@ -220,6 +259,14 @@ class PipelineTests(unittest.TestCase):
                 render_module.asyncio.create_subprocess_exec = original
             self.assertEqual(summary["job_count"], 6)
             self.assertEqual(summary["gpu_ids"], [0, 1])
+            self.assertEqual(summary["successful_job_count"], 5)
+            self.assertEqual(summary["failed_job_count"], 1)
+            self.assertTrue(
+                all(
+                    value.split(os.pathsep, 1)[0] == str(renderer.parent)
+                    for value in calls["paths"]
+                )
+            )
             self.assertEqual(sum(row["job_count"] for row in summary["executions"]), 6)
             resumed = asyncio.run(
                 render_module.render_shards(
@@ -232,6 +279,274 @@ class PipelineTests(unittest.TestCase):
             )
             self.assertEqual(calls["count"], 1)
             self.assertEqual(resumed["resumed_shard_count"], 1)
+
+    def test_baseline_context_dispatch_validates_requested_views(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            checkpoints = {}
+            checkpoint_hashes = {}
+            for name in ("storm", "cvac", "dcn"):
+                path = root / f"{name}.ckpt"
+                path.write_text(name, encoding="utf-8")
+                checkpoint_hashes[name] = sha256_file(path)
+                checkpoints[name] = {
+                    "path": str(path),
+                    "sha256": checkpoint_hashes[name],
+                }
+            contract = root / "contract.json"
+            atomic_json(contract, {"artifacts": checkpoints})
+            exposure = {
+                "camera_name": "CAM_FRONT",
+                "camera_exposure_timestamp_us": 100,
+                "sample_data_token": "sample-data",
+                "sample_token": "sample",
+            }
+            job = {
+                "job_kind": "sixcam_baseline_context",
+                "job_id": "baseline-one",
+                "job_sha256": "job-hash",
+                "split": "train",
+                "context_id": "scene-0001__w000001__aaaaaaaaaaaa",
+                "scene_name": "scene-0001",
+                "checkpoint_sha256": checkpoint_hashes,
+                "requested_views": [
+                    {"frame_index": 4, "camera_id": "0", "exposure": exposure}
+                ],
+            }
+            jobs = root / "jobs.jsonl"
+            atomic_jsonl(jobs, [job])
+            renderer = root / "renderer.py"
+            renderer.write_text("executable marker\n", encoding="utf-8")
+            renderer.chmod(0o755)
+
+            class FakeProcess:
+                returncode = 0
+
+                async def communicate(self):
+                    return b"ok", None
+
+            async def create_process(*arguments, **_kwargs):
+                values = list(arguments)
+                result_path = Path(values[values.index("--results") + 1])
+                view = {
+                    "frame_index": 4,
+                    "camera_id": "0",
+                    "exposure": exposure,
+                    "paths": {"gt": "/gt.png", "target": "/target.png"},
+                    "content_sha256": {"gt": "a" * 64, "target": "b" * 64},
+                }
+                result = {
+                    "status": "complete",
+                    "job_kind": job["job_kind"],
+                    "job_id": job["job_id"],
+                    "job_sha256": job["job_sha256"],
+                    "split": job["split"],
+                    "context_id": job["context_id"],
+                    "scene_name": job["scene_name"],
+                    "checkpoint_sha256": checkpoint_hashes,
+                    "views": [view],
+                }
+                result["result_sha256"] = canonical_sha256(result)
+                atomic_jsonl(result_path, [result])
+                return FakeProcess()
+
+            original = render_module.asyncio.create_subprocess_exec
+            render_module.asyncio.create_subprocess_exec = create_process
+            try:
+                summary = asyncio.run(
+                    render_module.render_shards(
+                        jobs,
+                        root / "render",
+                        renderer,
+                        contract,
+                        gpus=(0, 1),
+                    )
+                )
+            finally:
+                render_module.asyncio.create_subprocess_exec = original
+            self.assertEqual(summary["job_count"], 1)
+            self.assertEqual(summary["successful_job_count"], 1)
+            self.assertEqual(summary["failed_job_count"], 0)
+            self.assertEqual(summary["checkpoint_sha256"], checkpoint_hashes)
+
+    def test_baseline_context_dispatch_tolerates_signed_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            artifacts = {}
+            hashes = {}
+            for name in ("storm", "cvac", "dcn"):
+                path = root / name
+                path.write_text(name, encoding="utf-8")
+                hashes[name] = sha256_file(path)
+                artifacts[name] = {"path": str(path), "sha256": hashes[name]}
+            contract = root / "contract.json"
+            atomic_json(contract, {"artifacts": artifacts})
+            job = {
+                "job_kind": "sixcam_baseline_context",
+                "job_id": "baseline-failed",
+                "job_sha256": "failed-job-hash",
+                "split": "train",
+                "context_id": "scene-0001__w000002__bbbbbbbbbbbb",
+                "scene_name": "scene-0001",
+                "checkpoint_sha256": hashes,
+                "requested_views": [
+                    {"frame_index": 5, "camera_id": "0", "exposure": {}}
+                ],
+            }
+            jobs = root / "jobs.jsonl"
+            atomic_jsonl(jobs, [job])
+            renderer = root / "renderer"
+            renderer.write_text("marker\n", encoding="utf-8")
+            renderer.chmod(0o755)
+
+            class FakeProcess:
+                returncode = 0
+
+                async def communicate(self):
+                    return b"failed but continued", None
+
+            async def create_process(*arguments, **_kwargs):
+                values = list(arguments)
+                result_path = Path(values[values.index("--results") + 1])
+                result = {
+                    "schema_version": 1,
+                    "status": "failed",
+                    "job_kind": job["job_kind"],
+                    "job_id": job["job_id"],
+                    "job_sha256": job["job_sha256"],
+                    "split": job["split"],
+                    "context_id": job["context_id"],
+                    "scene_name": job["scene_name"],
+                    "checkpoint_sha256": hashes,
+                    "views": [],
+                    "error": {"type": "ValueError", "message": "bad context"},
+                }
+                result["result_sha256"] = canonical_sha256(result)
+                atomic_jsonl(result_path, [result])
+                return FakeProcess()
+
+            original = render_module.asyncio.create_subprocess_exec
+            render_module.asyncio.create_subprocess_exec = create_process
+            try:
+                summary = asyncio.run(
+                    render_module.render_shards(
+                        jobs, root / "render", renderer, contract, gpus=(0,)
+                    )
+                )
+            finally:
+                render_module.asyncio.create_subprocess_exec = original
+            self.assertEqual(summary["successful_job_count"], 0)
+            self.assertEqual(summary["failed_job_count"], 1)
+
+    def test_strict_production_controller_uses_requested_four_gpus(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            indices = {}
+            profiles = {}
+            for split in ("train", "val"):
+                index = root / f"{split}-index"
+                index.mkdir()
+                atomic_json(
+                    index / "summary.json",
+                    {
+                        "status": "complete",
+                        "split": split,
+                        "content_verification": {"performed": True},
+                    },
+                )
+                atomic_jsonl(index / "baseline_jobs.jsonl", [])
+                atomic_jsonl(index / "visible_backfill_jobs.jsonl", [])
+                indices[split] = index
+                profile = root / f"{split}-profile.json"
+                atomic_json(profile, {})
+                profiles[split] = profile
+            executable = root / "python"
+            executable.write_text("marker\n", encoding="utf-8")
+            executable.chmod(0o755)
+            contract = root / "contract.json"
+            atomic_json(contract, {})
+            calls = []
+
+            async def fake_render(jobs, output, *_args, **kwargs):
+                output.mkdir(parents=True, exist_ok=True)
+                results = output / "results.jsonl"
+                atomic_jsonl(results, [])
+                calls.append(
+                    (
+                        jobs.name,
+                        tuple(kwargs["gpus"]),
+                        kwargs["shards_per_worker"],
+                    )
+                )
+                return {"status": "complete", "results": str(results)}
+
+            def fake_compose(_results, output):
+                output.mkdir(parents=True, exist_ok=True)
+                records = output / "records.jsonl"
+                atomic_jsonl(records, [])
+                return {"status": "complete", "records": str(records)}
+
+            def fake_publish(**_kwargs):
+                return {"status": "complete", "group_count": 1}
+
+            def fake_audit(*_args, **_kwargs):
+                return {"status": "pass"}
+
+            originals = (
+                production_module.render_shards,
+                production_module.compose_results,
+                production_module.publish_strict_sixcam_release,
+                production_module.audit_strict_sixcam_release,
+            )
+            production_module.render_shards = fake_render
+            production_module.compose_results = fake_compose
+            production_module.publish_strict_sixcam_release = fake_publish
+            production_module.audit_strict_sixcam_release = fake_audit
+            try:
+                asyncio.run(
+                    production_module.run_strict_sixcam_production(
+                        train_index=indices["train"],
+                        val_index=indices["val"],
+                        train_profile=profiles["train"],
+                        val_profile=profiles["val"],
+                        baseline_python=executable,
+                        visible_python=executable,
+                        render_contract=contract,
+                        work_root=root / "work",
+                        destination=root / "destination",
+                        receipt_root=root / "receipt",
+                        gpus=(0, 1, 2, 3),
+                    )
+                )
+            finally:
+                (
+                    production_module.render_shards,
+                    production_module.compose_results,
+                    production_module.publish_strict_sixcam_release,
+                    production_module.audit_strict_sixcam_release,
+                ) = originals
+            self.assertEqual(len(calls), 4)
+            self.assertTrue(
+                all(gpus == (0, 1, 2, 3) for _name, gpus, _shards in calls)
+            )
+            self.assertEqual(
+                [shards for name, _gpus, shards in calls if name == "baseline_jobs.jsonl"],
+                [4, 4],
+            )
+            self.assertEqual(
+                [
+                    shards
+                    for name, _gpus, shards in calls
+                    if name == "visible_backfill_jobs.jsonl"
+                ],
+                [1, 1],
+            )
+            self.assertEqual(
+                json.loads((root / "work/production_state.json").read_text())[
+                    "status"
+                ],
+                "complete",
+            )
 
     def test_async_json_schema_review_is_concurrent(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -705,7 +1020,30 @@ class PipelineTests(unittest.TestCase):
         python_files = sorted(root.glob("driveharm/*.py")) + sorted(
             root.glob("tests/*.py")
         )
-        self.assertLessEqual(len(python_files), 13)
+        expected_python_files = {
+            "driveharm/__init__.py",
+            "driveharm/audit.py",
+            "driveharm/cli.py",
+            "driveharm/compose.py",
+            "driveharm/contracts.py",
+            "driveharm/planning.py",
+            "driveharm/release.py",
+            "driveharm/render.py",
+            "driveharm/review.py",
+            "driveharm/sixcam.py",
+            "driveharm/sixcam_index.py",
+            "driveharm/sixcam_pilot.py",
+            "driveharm/sixcam_production.py",
+            "driveharm/storm_adapter.py",
+            "driveharm/storm_baseline.py",
+            "tests/test_pipeline.py",
+            "tests/test_sixcam.py",
+            "tests/test_sixcam_index.py",
+        }
+        self.assertEqual(
+            {str(path.relative_to(root)) for path in python_files},
+            expected_python_files,
+        )
         source = "\n".join(path.read_text(encoding="utf-8") for path in python_files)
         self.assertIn("AsyncOpenAI", source)
         self.assertIn("await client.chat.completions.create", source)

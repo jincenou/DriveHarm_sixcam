@@ -15,7 +15,15 @@ from .planning import build_plan
 from .release import publish_release, quarantine_triplets
 from .render import render_shards
 from .review import review_manifest
-from .sixcam import audit_sixcam_release, build_sixcam_release
+from .sixcam import (
+    audit_sixcam_release,
+    audit_strict_sixcam_release,
+    build_strict_sixcam_review_sheets,
+    build_sixcam_release,
+    publish_strict_sixcam_release,
+)
+from .sixcam_index import build_strict_sixcam_index
+from .sixcam_pilot import build_strict_sixcam_pilot_plan
 
 
 def _gpus(value: str) -> tuple[int, ...]:
@@ -248,6 +256,61 @@ def parser() -> argparse.ArgumentParser:
     ring_audit.add_argument("--output-root", type=Path, required=True)
     ring_audit.add_argument("--workers", type=int, default=32)
 
+    strict_index = sub.add_parser("sixcam-index")
+    strict_index.add_argument("--split", choices=("train", "val"), required=True)
+    strict_index.add_argument("--source-root", type=Path, required=True)
+    strict_index.add_argument("--records", type=Path, required=True)
+    strict_index.add_argument("--metadata", type=Path, action="append", default=[])
+    strict_index.add_argument("--visibility-manifest", type=Path, required=True)
+    strict_index.add_argument("--trajectory-plan", type=Path, required=True)
+    strict_index.add_argument("--sample-data-table", type=Path, required=True)
+    strict_index.add_argument("--official-scenes", type=Path, required=True)
+    strict_index.add_argument("--render-contract", type=Path, required=True)
+    strict_index.add_argument("--output-root", type=Path, required=True)
+    strict_index.add_argument("--workers", type=int, default=32)
+    strict_index.add_argument(
+        "--skip-content-verification",
+        action="store_true",
+        help="development-only: trust recorded source/checkpoint hashes",
+    )
+
+    strict_release = sub.add_parser("sixcam-strict-release")
+    strict_release.add_argument(
+        "--index-root", type=Path, action="append", required=True
+    )
+    strict_release.add_argument(
+        "--baseline-results", type=Path, action="append", default=[]
+    )
+    strict_release.add_argument(
+        "--visible-results", type=Path, action="append", default=[]
+    )
+    strict_release.add_argument("--selection", type=Path)
+    strict_release.add_argument("--destination", type=Path, required=True)
+    strict_release.add_argument("--receipt-root", type=Path, required=True)
+    strict_release.add_argument(
+        "--materialize", choices=("hardlink", "copy"), default="hardlink"
+    )
+    strict_release.add_argument("--replace", action="store_true")
+    strict_release.add_argument("--workers", type=int, default=32)
+
+    strict_audit = sub.add_parser("sixcam-strict-audit")
+    strict_audit.add_argument("--dataset-root", type=Path, required=True)
+    strict_audit.add_argument("--output-root", type=Path, required=True)
+    strict_audit.add_argument("--workers", type=int, default=32)
+
+    strict_pilot = sub.add_parser("sixcam-pilot-plan")
+    strict_pilot.add_argument(
+        "--index-root", type=Path, action="append", required=True
+    )
+    strict_pilot.add_argument("--output-root", type=Path, required=True)
+    strict_pilot.add_argument("--train-count", type=int, default=8)
+    strict_pilot.add_argument("--val-count", type=int, default=4)
+    strict_pilot.add_argument("--direct-reuse-count", type=int, default=2)
+
+    strict_sheets = sub.add_parser("sixcam-review-sheets")
+    strict_sheets.add_argument("--dataset-root", type=Path, required=True)
+    strict_sheets.add_argument("--output-root", type=Path, required=True)
+
     run = sub.add_parser("run")
     run.add_argument("--asset-post", type=Path, required=True)
     run.add_argument("--observations", type=Path, required=True)
@@ -359,6 +422,49 @@ def main() -> int:
             args.visibility_manifest,
             args.output_root,
             args.workers,
+        )
+    elif args.command == "sixcam-index":
+        result = build_strict_sixcam_index(
+            split=args.split,
+            source_root=args.source_root,
+            records_path=args.records,
+            metadata_paths=args.metadata,
+            visibility_manifest=args.visibility_manifest,
+            trajectory_plan=args.trajectory_plan,
+            sample_data_table=args.sample_data_table,
+            official_scenes=args.official_scenes,
+            render_contract=args.render_contract,
+            output_root=args.output_root,
+            verify_content=not args.skip_content_verification,
+            workers=args.workers,
+        )
+    elif args.command == "sixcam-strict-release":
+        result = publish_strict_sixcam_release(
+            index_roots=args.index_root,
+            destination=args.destination,
+            receipt_root=args.receipt_root,
+            baseline_result_paths=args.baseline_results,
+            visible_result_paths=args.visible_results,
+            selection_path=args.selection,
+            materialize=args.materialize,
+            replace=args.replace,
+            workers=args.workers,
+        )
+    elif args.command == "sixcam-strict-audit":
+        result = audit_strict_sixcam_release(
+            args.dataset_root, args.output_root, args.workers
+        )
+    elif args.command == "sixcam-pilot-plan":
+        result = build_strict_sixcam_pilot_plan(
+            args.index_root,
+            args.output_root,
+            args.train_count,
+            args.val_count,
+            args.direct_reuse_count,
+        )
+    elif args.command == "sixcam-review-sheets":
+        result = build_strict_sixcam_review_sheets(
+            args.dataset_root, args.output_root
         )
     else:
         result = asyncio.run(_run(args))

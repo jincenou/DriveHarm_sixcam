@@ -8,11 +8,211 @@ import unittest
 import numpy as np
 from PIL import Image
 
-from driveharm.contracts import atomic_json, atomic_jsonl, sha256_file
-from driveharm.sixcam import CAMERA_RING, audit_sixcam_release, build_sixcam_release
+from driveharm.contracts import (
+    atomic_json,
+    atomic_jsonl,
+    canonical_sha256,
+    sha256_file,
+)
+from driveharm.sixcam import (
+    CAMERA_RING,
+    audit_sixcam_release,
+    audit_strict_sixcam_release,
+    build_strict_sixcam_review_sheets,
+    build_sixcam_release,
+    publish_strict_sixcam_release,
+)
 
 
 class SixCameraReleaseTests(unittest.TestCase):
+    def test_strict_root_release_and_inode_aware_reaudit(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source_root = root / "sources"
+            source_root.mkdir()
+            checkpoint_hashes = {
+                "storm": "a" * 64,
+                "cvac": "b" * 64,
+                "dcn": "c" * 64,
+            }
+            asset = {
+                "global_uid": "asset-one",
+                "obj_id": "obj-one",
+                "instance_token": "token-one",
+                "category": "car",
+                "canonical_asset_path": "/asset.ply",
+                "canonical_asset_sha256": "d" * 64,
+                "exact_asset_manifest_sha256": "e" * 64,
+                "forward_axis": "+X",
+            }
+            sources = []
+            exposures = {}
+            for ordinal, (camera, camera_name) in enumerate(CAMERA_RING):
+                sample_id = f"source-c{camera}"
+                paths = {}
+                hashes = {}
+                for role_index, role in enumerate(("gt", "input", "target")):
+                    value = 20 + ordinal * 20 + role_index
+                    if role == "input" and camera == "0":
+                        value += 20
+                    path = source_root / f"{sample_id}__{role}.png"
+                    Image.fromarray(
+                        np.full((288, 512, 3), value, dtype=np.uint8), mode="RGB"
+                    ).save(path)
+                    paths[role] = str(path)
+                    hashes[role] = sha256_file(path)
+                exposure = {
+                    "camera_id": camera,
+                    "camera_name": camera_name,
+                    "camera_exposure_timestamp_us": 1000 + ordinal,
+                    "sample_data_timestamp_us": 1000 + ordinal,
+                    "image_path": f"/raw/{camera_name}.jpg",
+                    "sample_data_token": f"sample-data-{camera}",
+                    "sample_token": "sample-token-one",
+                    "official_filename": f"samples/{camera_name}/x.jpg",
+                }
+                exposures[camera] = exposure
+                row = {
+                    "schema_version": 1,
+                    "source_kind": "accepted_nusc_pair",
+                    "split": "train",
+                    "sample_id": sample_id,
+                    "context_id": "scene-0001__w000010__111111111111",
+                    "scene_name": "scene-0001",
+                    "frame_index": 13,
+                    "camera_id": camera,
+                    "camera_name": camera_name,
+                    "combination_id": "combination-one",
+                    "selected_asset_ids": ["asset-one"],
+                    "assets": [asset],
+                    "checkpoint_sha256": checkpoint_hashes,
+                    "exposure": exposure,
+                    "paths": paths,
+                    "content_sha256": hashes,
+                    "lineage_status": "complete",
+                    "authority": {"row_sha256": "f" * 64},
+                    "production_metadata": {"row_sha256": "1" * 64},
+                    "production_record": None,
+                    "quality_gate_pass": True,
+                }
+                row["record_sha256"] = canonical_sha256(row)
+                sources.append(row)
+            identity = {
+                "schema_version": 1,
+                "split": "train",
+                "context_id": "scene-0001__w000010__111111111111",
+                "scene_name": "scene-0001",
+                "sample_token": "sample-token-one",
+                "frame_index": 13,
+                "asset_union": [
+                    {
+                        "global_uid": "asset-one",
+                        "obj_id": "obj-one",
+                        "instance_token": "token-one",
+                        "canonical_asset_sha256": "d" * 64,
+                    }
+                ],
+                "checkpoint_sha256": checkpoint_hashes,
+            }
+            identity_sha = canonical_sha256(identity)
+            group = {
+                "schema_version": 2,
+                "status": "ready",
+                "group_id": f"train__scene-0001__f000013__g-{identity_sha[:16]}",
+                "group_identity": identity,
+                "group_identity_sha256": identity_sha,
+                "split": "train",
+                "context_id": identity["context_id"],
+                "scene_name": "scene-0001",
+                "sample_token": "sample-token-one",
+                "frame_index": 13,
+                "asset_union": [asset],
+                "asset_state_sha256": {"asset-one": "2" * 64},
+                "views": [],
+            }
+            for camera, camera_name in CAMERA_RING:
+                visible = camera == "0"
+                group["views"].append(
+                    {
+                        "camera_id": camera,
+                        "camera_name": camera_name,
+                        "status": "ready",
+                        "visible": visible,
+                        "no_op": not visible,
+                        "no_op_reason": None if visible else "frozen visibility says absent",
+                        "camera_visible_asset_ids": ["asset-one"] if visible else [],
+                        "camera_invisible_asset_ids": [] if visible else ["asset-one"],
+                        "asset_state_sha256": (
+                            {"asset-one": "2" * 64} if visible else {}
+                        ),
+                        "exposure": exposures[camera],
+                        "baseline_source_sample_id": f"source-c{camera}",
+                        "pair_source_sample_id": "source-c0" if visible else None,
+                    }
+                )
+            group["record_sha256"] = canonical_sha256(group)
+
+            index = root / "index"
+            index.mkdir()
+            files = {
+                "source_index": index / "source_index.jsonl",
+                "groups": index / "groups.jsonl",
+                "baseline_jobs": index / "baseline_jobs.jsonl",
+                "visible_backfill_jobs": index / "visible_backfill_jobs.jsonl",
+            }
+            atomic_jsonl(files["source_index"], sources)
+            atomic_jsonl(files["groups"], [group])
+            atomic_jsonl(files["baseline_jobs"], [])
+            atomic_jsonl(files["visible_backfill_jobs"], [])
+            atomic_json(
+                index / "summary.json",
+                {
+                    "status": "complete",
+                    "split": "train",
+                    "content_verification": {"performed": True},
+                    "outputs": {
+                        name: {"path": str(path.resolve()), "sha256": sha256_file(path)}
+                        for name, path in files.items()
+                    },
+                },
+            )
+            destination = root / "strict-release"
+            summary = publish_strict_sixcam_release(
+                index_roots=[index],
+                destination=destination,
+                receipt_root=root / "receipt",
+                materialize="hardlink",
+            )
+            self.assertEqual(summary["group_count"], 1)
+            self.assertEqual(summary["image_count"], 18)
+            self.assertEqual(len(list((destination / "train").glob("*.png"))), 18)
+            self.assertEqual(len(list((destination / "val").glob("*.png"))), 0)
+            manifest = json.loads(
+                (destination / "metadata/train_groups.jsonl").read_text()
+            )
+            for view in manifest["views"]:
+                if view["no_op"]:
+                    input_path = destination / "train" / (
+                        f"{manifest['group_id']}__{view['camera_name']}__input.png"
+                    )
+                    target_path = destination / "train" / (
+                        f"{manifest['group_id']}__{view['camera_name']}__target.png"
+                    )
+                    self.assertTrue(input_path.samefile(target_path))
+            audited = audit_strict_sixcam_release(
+                destination, root / "independent-audit"
+            )
+            self.assertEqual(audited["status"], "pass")
+            self.assertEqual(audited["logical_image_count"], 18)
+            sheets = build_strict_sixcam_review_sheets(
+                destination, root / "review-sheets"
+            )
+            self.assertEqual(sheets["group_count"], 1)
+            self.assertEqual(sheets["image_count"], 18)
+            sheet = next((root / "review-sheets/train").glob("*.png"))
+            with Image.open(sheet) as image:
+                self.assertEqual(image.size, (512 * 3, (288 + 24) * 6))
+
     def test_flat_eighteen_image_group_and_invisible_noop(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

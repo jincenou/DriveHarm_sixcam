@@ -11,11 +11,17 @@ from .contracts import (
     atomic_json,
     atomic_jsonl,
     canonical_sha256,
-    indexed_rows,
     iter_jsonl,
     read_json,
     sha256_file,
 )
+
+
+def _job_identity(row: dict[str, Any]) -> str:
+    value = str(row.get("sample_id") or row.get("job_id") or "")
+    if not value:
+        raise ValueError("render job/result has no stable identity")
+    return value
 
 
 async def render_shards(
@@ -55,17 +61,20 @@ async def render_shards(
     slots = [(gpu, worker) for gpu in gpus for worker in range(workers_per_gpu)]
     locality_groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for job in jobs:
-        key = (str(job.get("scene_name") or ""), str(job.get("window_id") or ""))
+        key = (
+            str(job.get("scene_name") or ""),
+            str(job.get("window_id") or job.get("context_id") or ""),
+        )
         locality_groups.setdefault(key, []).append(job)
     shard_count = min(len(locality_groups), len(slots) * shards_per_worker)
     shards: list[list[dict[str, Any]]] = [[] for _ in range(shard_count)]
     ordered_groups = sorted(
         locality_groups.values(),
-        key=lambda values: (-len(values), str(values[0]["sample_id"])),
+        key=lambda values: (-len(values), _job_identity(values[0])),
     )
     for group in ordered_groups:
         target = min(range(len(shards)), key=lambda index: (len(shards[index]), index))
-        shards[target].extend(sorted(group, key=lambda row: str(row["sample_id"])))
+        shards[target].extend(sorted(group, key=_job_identity))
     output_root.mkdir(parents=True, exist_ok=True)
     shard_root = output_root / "shards"
     shard_root.mkdir(parents=True, exist_ok=True)
@@ -82,25 +91,101 @@ async def render_shards(
             }
         shard = shard_root / f"shard{index:04d}"
         shard.mkdir(parents=True, exist_ok=True)
-        expected_rows = {str(row["sample_id"]): row for row in shard_jobs}
+        expected_rows = {_job_identity(row): row for row in shard_jobs}
+        if len(expected_rows) != len(shard_jobs):
+            raise ValueError("render shard contains duplicate job identities")
 
         def validated(result_path: Path) -> None:
-            results = indexed_rows(result_path, "sample_id")
+            results: dict[str, dict[str, Any]] = {}
+            for result in iter_jsonl(result_path):
+                identity = _job_identity(result)
+                if identity in results:
+                    raise RuntimeError("result membership is duplicated")
+                results[identity] = result
             if set(results) != set(expected_rows):
                 raise RuntimeError("result membership differs")
-            if any(row.get("status") != "complete" for row in results.values()):
-                raise RuntimeError("results contain incomplete rows")
-            for sample_id, result in results.items():
-                job = expected_rows[sample_id]
-                if (
-                    result.get("job_sha256") != job.get("job_sha256")
-                    or list(result.get("selected_obj_ids") or [])
+            for identity, result in results.items():
+                job = expected_rows[identity]
+                if result.get("job_sha256") != job.get("job_sha256"):
+                    raise RuntimeError(f"result is not bound to its job: {identity}")
+                if result.get("checkpoint_sha256") != checkpoint_hashes:
+                    raise RuntimeError(f"result checkpoint differs: {identity}")
+                if job.get("job_kind") == "sixcam_baseline_context":
+                    unsigned = dict(result)
+                    claimed = str(unsigned.pop("result_sha256", ""))
+                    status = result.get("status")
+                    if status not in {"complete", "failed"}:
+                        raise RuntimeError(
+                            f"baseline result status differs: {identity}"
+                        )
+                    if (
+                        claimed != canonical_sha256(unsigned)
+                        or result.get("job_kind") != job.get("job_kind")
+                        or result.get("context_id") != job.get("context_id")
+                        or result.get("scene_name") != job.get("scene_name")
+                        or result.get("split") != job.get("split")
+                    ):
+                        raise RuntimeError(
+                            f"baseline result contract differs: {identity}"
+                        )
+                    if status == "failed":
+                        error = result.get("error") or {}
+                        if result.get("views") or not str(error.get("type") or ""):
+                            raise RuntimeError(
+                                f"baseline failure receipt differs: {identity}"
+                            )
+                        continue
+                    expected_views = {
+                        (int(row["frame_index"]), str(row["camera_id"])): row
+                        for row in job.get("requested_views") or []
+                    }
+                    observed_views = {
+                        (int(row.get("frame_index", -1)), str(row.get("camera_id") or "")): row
+                        for row in result.get("views") or []
+                    }
+                    if (
+                        set(observed_views) != set(expected_views)
+                        or len(observed_views) != len(result.get("views") or [])
+                    ):
+                        raise RuntimeError(f"baseline result contract differs: {identity}")
+                    for key, view in observed_views.items():
+                        if (
+                            view.get("exposure") != expected_views[key].get("exposure")
+                            or set(view.get("paths") or {}) != {"gt", "target"}
+                            or set(view.get("content_sha256") or {}) != {"gt", "target"}
+                            or any(
+                                len(str(value or "")) != 64
+                                for value in (view.get("content_sha256") or {}).values()
+                            )
+                        ):
+                            raise RuntimeError(
+                                f"baseline view result contract differs: {identity}:{key}"
+                            )
+                elif result.get("status") == "failed":
+                    unsigned = dict(result)
+                    claimed = str(unsigned.pop("result_sha256", ""))
+                    error = result.get("error") or {}
+                    if (
+                        claimed != canonical_sha256(unsigned)
+                        or not str(error.get("type") or "")
+                        or result.get("scene_name") != job.get("scene_name")
+                        or int(result.get("frame_index", -1))
+                        != int(job.get("frame_index", -2))
+                        or str(result.get("camera_id") or "")
+                        != str(job.get("camera_id") or "")
+                        or list(result.get("selected_obj_ids") or [])
+                        != list(job.get("selected_obj_ids") or [])
+                    ):
+                        raise RuntimeError(
+                            f"failed render receipt is not bound to its job: {identity}"
+                        )
+                elif result.get("status") != "complete" or (
+                    list(result.get("selected_obj_ids") or [])
                     != list(job["selected_obj_ids"])
                     or str(result.get("camera_id")) != str(job["camera_id"])
                     or int(result.get("frame_index", -1)) != int(job["frame_index"])
-                    or result.get("checkpoint_sha256") != checkpoint_hashes
                 ):
-                    raise RuntimeError(f"result is not bound to its job: {sample_id}")
+                    raise RuntimeError(f"result is not bound to its job: {identity}")
 
         attempts = sorted(path for path in shard.glob("attempt*") if path.is_dir())
         for attempt in reversed(attempts):
@@ -133,6 +218,9 @@ async def render_shards(
         environment = dict(os.environ)
         environment["CUDA_VISIBLE_DEVICES"] = str(gpu)
         environment["DRIVEHARM_PHYSICAL_GPU"] = str(gpu)
+        environment["PATH"] = os.pathsep.join(
+            [str(renderer.parent), environment.get("PATH", "")]
+        )
         process = await asyncio.create_subprocess_exec(
             str(renderer),
             *renderer_args,
@@ -195,7 +283,7 @@ async def render_shards(
         raw = execution.get("results")
         if raw:
             result_rows.extend(iter_jsonl(Path(str(raw))))
-    result_rows.sort(key=lambda row: str(row["sample_id"]))
+    result_rows.sort(key=_job_identity)
     if len(result_rows) != len(jobs):
         raise RuntimeError("combined render result count differs")
     combined = output_root / "results.jsonl"
@@ -204,6 +292,10 @@ async def render_shards(
         "schema_version": 1,
         "status": "complete",
         "job_count": len(jobs),
+        "successful_job_count": sum(
+            row.get("status") == "complete" for row in result_rows
+        ),
+        "failed_job_count": sum(row.get("status") == "failed" for row in result_rows),
         "gpu_ids": list(gpus),
         "workers_per_gpu": workers_per_gpu,
         "checkpoint_sha256": checkpoint_hashes,

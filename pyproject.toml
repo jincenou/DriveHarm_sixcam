@@ -13,6 +13,8 @@ dependencies = ["numpy>=1.23", "Pillow>=10", "openai>=2.0"]
 driveharm = "driveharm.cli:main"
 driveharm-sixcam = "driveharm.cli:main"
 driveharm-storm-renderer = "driveharm.storm_adapter:main"
+driveharm-storm-baseline = "driveharm.storm_baseline:main"
+driveharm-sixcam-production = "driveharm.sixcam_production:main"
 
 [tool.setuptools]
 packages = ["driveharm"]
