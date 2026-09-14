@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import json
@@ -803,6 +803,21 @@ def _role_source(
     }
 
 
+def _accepted_source_has_complete_lineage(row: dict[str, Any]) -> bool:
+    production_metadata = row.get("production_metadata") or {}
+    production_record = str(row.get("production_record") or "")
+    return (
+        row.get("lineage_status") == "complete"
+        and row.get("quality_gate_pass") is True
+        and bool(production_record)
+        and Path(production_record).is_file()
+        and all(
+            production_metadata.get(key)
+            for key in ("manifest", "manifest_sha256", "row_sha256", "line_number")
+        )
+    )
+
+
 def _resolve_strict_group(
     group: dict[str, Any],
     sources: dict[str, dict[str, Any]],
@@ -867,7 +882,8 @@ def _resolve_strict_group(
         baseline = sources.get(str(baseline_id)) if baseline_id else None
         if baseline is not None:
             if (
-                baseline.get("split") != group.get("split")
+                not _accepted_source_has_complete_lineage(baseline)
+                or baseline.get("split") != group.get("split")
                 or baseline.get("context_id") != group.get("context_id")
                 or int(baseline.get("frame_index", -1)) != int(group.get("frame_index", -2))
                 or str(baseline.get("camera_id") or "") != camera
@@ -879,13 +895,25 @@ def _resolve_strict_group(
                 baseline["paths"]["gt"],
                 baseline["content_sha256"]["gt"],
                 "accepted_nusc_pair",
-                {"sample_id": baseline["sample_id"], "authority": baseline["authority"]},
+                {
+                    "sample_id": baseline["sample_id"],
+                    "combination_id": baseline.get("combination_id"),
+                    "production_record": baseline.get("production_record"),
+                    "production_metadata": baseline.get("production_metadata"),
+                    "authority": baseline["authority"],
+                },
             )
             target = _role_source(
                 baseline["paths"]["target"],
                 baseline["content_sha256"]["target"],
                 "accepted_nusc_pair",
-                {"sample_id": baseline["sample_id"], "authority": baseline["authority"]},
+                {
+                    "sample_id": baseline["sample_id"],
+                    "combination_id": baseline.get("combination_id"),
+                    "production_record": baseline.get("production_record"),
+                    "production_metadata": baseline.get("production_metadata"),
+                    "authority": baseline["authority"],
+                },
             )
         else:
             baseline_result = baseline_results.get(key)
@@ -921,7 +949,8 @@ def _resolve_strict_group(
             }
         elif pair is not None:
             if (
-                tuple(pair.get("selected_asset_ids") or ()) != visible
+                not _accepted_source_has_complete_lineage(pair)
+                or tuple(pair.get("selected_asset_ids") or ()) != visible
                 or pair.get("context_id") != group.get("context_id")
                 or int(pair.get("frame_index", -1)) != int(group.get("frame_index", -2))
                 or str(pair.get("camera_id") or "") != camera
@@ -934,6 +963,8 @@ def _resolve_strict_group(
                 "accepted_nusc_pair",
                 {
                     "sample_id": pair["sample_id"],
+                    "combination_id": pair.get("combination_id"),
+                    "production_record": pair.get("production_record"),
                     "authority": pair["authority"],
                     "production_metadata": pair.get("production_metadata"),
                     "lineage_status": pair.get("lineage_status"),
@@ -1004,6 +1035,10 @@ def _resolve_strict_group(
         "asset_union": group["asset_union"],
         "asset_state_sha256": group["asset_state_sha256"],
         "views": resolved_views,
+        "review": {
+            "status": "accepted",
+            "policy": "strict_complete_group_or_quarantine",
+        },
     }
     record["record_sha256"] = canonical_sha256(record)
     return record
@@ -1029,6 +1064,336 @@ def _inspect_strict_source(task: tuple[Path, str]) -> tuple[Path, list[str]]:
     return path, errors
 
 
+def _bind_strict_published_paths(records: Sequence[dict[str, Any]]) -> None:
+    """Bind every role receipt to its portable path in the formal release."""
+    for row in records:
+        for view in row["views"]:
+            for role in ROLES:
+                filename = (
+                    f"{row['group_id']}__{view['camera_name']}__{role}.png"
+                )
+                view["role_sources"][role]["published_relative_path"] = (
+                    f"{row['split']}/{filename}"
+                )
+        unsigned = dict(row)
+        unsigned.pop("record_sha256", None)
+        row["record_sha256"] = canonical_sha256(unsigned)
+
+
+def _strict_release_statistics(
+    records: Sequence[dict[str, Any]],
+    quarantined: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    category_occurrences: Counter[str] = Counter()
+    category_assets: dict[str, set[str]] = defaultdict(set)
+    no_op_reasons: Counter[str] = Counter()
+    source_kinds: Counter[str] = Counter()
+    quarantine_reasons: Counter[str] = Counter()
+    asset_manifests: set[str] = set()
+    checkpoint_sets: set[tuple[tuple[str, str], ...]] = set()
+    visible_views = 0
+    no_op_views = 0
+    multi_asset_groups = 0
+    for row in records:
+        if len(row.get("asset_union") or []) > 1:
+            multi_asset_groups += 1
+        checkpoint_sets.add(
+            tuple(
+                sorted(
+                    (str(key), str(value))
+                    for key, value in (
+                        (row.get("group_identity") or {}).get("checkpoint_sha256")
+                        or {}
+                    ).items()
+                )
+            )
+        )
+        for asset in row.get("asset_union") or []:
+            category = str(asset.get("category") or "unknown")
+            category_occurrences[category] += 1
+            category_assets[category].add(str(asset.get("global_uid") or ""))
+            manifest = str(asset.get("exact_asset_manifest_sha256") or "")
+            if manifest:
+                asset_manifests.add(manifest)
+        for view in row.get("views") or []:
+            if view.get("visible") is True:
+                visible_views += 1
+            else:
+                no_op_views += 1
+                no_op_reasons[str(view.get("no_op_reason") or "unspecified")] += 1
+            for role_source in (view.get("role_sources") or {}).values():
+                source_kinds[str(role_source.get("source_kind") or "unknown")] += 1
+    for row in quarantined:
+        quarantine_reasons[str(row.get("reason") or "unspecified")] += 1
+    checkpoints = [dict(values) for values in sorted(checkpoint_sets)]
+    return {
+        "schema_version": 1,
+        "status": "complete",
+        "group_count": len(records),
+        "train_group_count": sum(row["split"] == "train" for row in records),
+        "val_group_count": sum(row["split"] == "val" for row in records),
+        "logical_image_count": len(records) * 18,
+        "visible_edited_view_count": visible_views,
+        "invisible_no_op_view_count": no_op_views,
+        "multi_asset_group_count": multi_asset_groups,
+        "category_asset_occurrence_count": dict(sorted(category_occurrences.items())),
+        "category_unique_asset_count": {
+            key: len(values) for key, values in sorted(category_assets.items())
+        },
+        "role_source_kind_count": dict(sorted(source_kinds.items())),
+        "no_op_reason_count": dict(sorted(no_op_reasons.items())),
+        "checkpoint_sha256_sets": checkpoints,
+        "asset_manifest_sha256": sorted(asset_manifests),
+        "quarantined_group_count": len(quarantined),
+        "quarantine_reason_count": dict(sorted(quarantine_reasons.items())),
+    }
+
+
+def _copy_provenance_file(
+    source: Path,
+    target: Path,
+    kind: str,
+    entries: list[dict[str, Any]],
+    metadata_root: Path,
+) -> None:
+    source = source.resolve(strict=True)
+    if source.is_symlink() or not source.is_file():
+        raise ValueError(f"provenance source is not a regular file: {source}")
+    if target.exists():
+        raise ValueError(f"duplicate provenance target: {target}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+    source_sha256 = sha256_file(source)
+    copied_sha256 = sha256_file(target)
+    if copied_sha256 != source_sha256:
+        raise RuntimeError(f"provenance copy hash mismatch: {target}")
+    entries.append(
+        {
+            "kind": kind,
+            "original_path": str(source),
+            "published_relative_path": str(target.relative_to(metadata_root.parent)),
+            "sha256": copied_sha256,
+            "size_bytes": target.stat().st_size,
+        }
+    )
+
+
+def _stage_strict_provenance(
+    *,
+    staging: Path,
+    index_roots: Sequence[Path],
+    baseline_result_paths: Sequence[Path],
+    visible_result_paths: Sequence[Path],
+    receipt_paths: Sequence[Path],
+    report_paths: Sequence[Path],
+) -> dict[str, Any]:
+    metadata_root = staging / "metadata"
+    source_index_root = metadata_root / "source_index"
+    receipts_root = metadata_root / "receipts"
+    reports_root = metadata_root / "reports"
+    for path in (source_index_root, receipts_root, reports_root):
+        path.mkdir(parents=True, exist_ok=True)
+    entries: list[dict[str, Any]] = []
+    for raw_root in index_roots:
+        root = raw_root.resolve(strict=True)
+        split = str(read_json((root / "summary.json").resolve(strict=True)).get("split"))
+        if split not in {"train", "val"}:
+            raise ValueError(f"cannot label strict source index: {root}")
+        for source in sorted(root.iterdir()):
+            if source.is_file() and source.suffix in {".json", ".jsonl"}:
+                _copy_provenance_file(
+                    source,
+                    source_index_root / split / source.name,
+                    "strict_source_index",
+                    entries,
+                    metadata_root,
+                )
+    used_receipt_names: set[str] = set()
+    for kind, paths in (
+        ("baseline_result", baseline_result_paths),
+        ("visible_result", visible_result_paths),
+    ):
+        for ordinal, raw_path in enumerate(paths):
+            source = raw_path.resolve(strict=True)
+            label = source.parent.name.replace("-", "_")
+            name = f"{label}_{source.name}"
+            if name in used_receipt_names:
+                name = f"{kind}_{ordinal:02d}_{source.name}"
+            used_receipt_names.add(name)
+            _copy_provenance_file(
+                source,
+                receipts_root / name,
+                kind,
+                entries,
+                metadata_root,
+            )
+    for ordinal, raw_path in enumerate(receipt_paths):
+        source = raw_path.resolve(strict=True)
+        parent_label = source.parent.name.replace("-", "_")
+        name = f"{parent_label}_{source.name}"
+        if name in used_receipt_names:
+            name = f"receipt_{ordinal:02d}_{name}"
+        used_receipt_names.add(name)
+        _copy_provenance_file(
+            source,
+            receipts_root / name,
+            "production_receipt",
+            entries,
+            metadata_root,
+        )
+    used_report_names: set[str] = set()
+    for ordinal, raw_path in enumerate(report_paths):
+        source = raw_path.resolve(strict=True)
+        name = source.name
+        if name in used_report_names:
+            name = f"report_{ordinal:02d}_{name}"
+        used_report_names.add(name)
+        _copy_provenance_file(
+            source,
+            reports_root / name,
+            "report",
+            entries,
+            metadata_root,
+        )
+    manifest = {
+        "schema_version": 1,
+        "status": "complete",
+        "entry_count": len(entries),
+        "entries": entries,
+    }
+    atomic_json(receipts_root / "provenance_manifest.json", manifest)
+    return manifest
+
+
+def _strict_release_readme(
+    destination: Path,
+    statistics: dict[str, Any],
+    audit: dict[str, Any] | None,
+    production_command: str | None,
+) -> str:
+    camera_lines = "\n".join(
+        f"{ordinal}. `{name}`" for ordinal, (_, name) in enumerate(CAMERA_RING, 1)
+    )
+    category_lines = "\n".join(
+        f"- `{category}`: {count:,} group-asset occurrences; "
+        f"{statistics['category_unique_asset_count'].get(category, 0):,} unique assets"
+        for category, count in statistics["category_asset_occurrence_count"].items()
+    )
+    checkpoint_lines = "\n".join(
+        f"- `{name}`: `{digest}`"
+        for values in statistics["checkpoint_sha256_sets"]
+        for name, digest in sorted(values.items())
+    )
+    asset_manifest_lines = "\n".join(
+        f"- `{value}`" for value in statistics["asset_manifest_sha256"]
+    )
+    quarantine_lines = "\n".join(
+        f"- {reason}: {count:,} groups"
+        for reason, count in statistics["quarantine_reason_count"].items()
+    )
+    run_command = production_command or (
+        "python -m driveharm.sixcam_production --train-index <train-index> "
+        "--val-index <val-index> --train-profile <train-profile> "
+        "--val-profile <val-profile> --baseline-python <python> "
+        "--visible-python <python> --render-contract <contract.json> "
+        "--work-root <work-root> --destination <dataset-root> "
+        "--receipt-root <receipt-root> --gpus 0,1,2,3,4,5,6,7"
+    )
+    audit_status = str((audit or {}).get("status") or "pending")
+    candidate_count = int((audit or {}).get("candidate_count") or 0)
+    return f"""# DriveHarm strict synchronized six-camera release
+
+## Definition and layout
+
+This is a strict, synchronized nuScenes six-camera dataset. Every `group_id`
+binds one official split, scene, target sample/frame, STORM context, global asset
+union, instance/PLY identity and frozen STORM/CVAC/DCN checkpoints. It is not a
+renaming of unrelated single-camera pairs.
+
+Each group has exactly 18 flat RGB PNG files: six `gt`, six edited/no-op `input`,
+and six STORM `target` images. Files are named
+`{{group_id}}__{{camera_name}}__{{gt|input|target}}.png` under `train/` or `val/`.
+
+The fixed ring order is:
+
+{camera_lines}
+
+## Counts
+
+- Groups: {statistics['group_count']:,} (train {statistics['train_group_count']:,}, val {statistics['val_group_count']:,})
+- Logical PNGs: {statistics['logical_image_count']:,}
+- Visible edited camera views: {statistics['visible_edited_view_count']:,}
+- Invisible byte-identical `input=target` no-op views: {statistics['invisible_no_op_view_count']:,}
+- Multi-asset groups: {statistics['multi_asset_group_count']:,}
+
+Category counts count every asset occurrence in a published group and also list
+the number of distinct `global_uid` values:
+
+{category_lines}
+
+## Provenance
+
+Source triplets come from the audited `nusc_pair/train` and `nusc_pair/val`
+releases. Missing six-camera STORM backgrounds and visible edits were rendered
+with the frozen pipeline. Every group receipt records scene, sample token, frame,
+camera exposure, visible/invisible asset partition, combination/source record,
+`obj_id`, `instance_token`, `global_uid`, PLY path/hash, role source path/hash,
+published relative path, per-asset depth/occlusion evidence where applicable,
+and the accepted review decision.
+
+Checkpoint SHA-256:
+
+{checkpoint_lines}
+
+Exact asset-manifest SHA-256:
+
+{asset_manifest_lines}
+
+Self-contained lineage is under `metadata/source_index/` and
+`metadata/receipts/`; reports are under `metadata/reports/`. The group receipts
+are `metadata/train_groups.jsonl` and `metadata/val_groups.jsonl`.
+
+## Review, quarantine and audit
+
+Visible views must have a non-zero edit and an accepted audited pair or signed
+backfill with exact identity, geometry, grounding, appearance and occlusion
+evidence. Invisible views are generated only from the frozen official visibility
+partition and must have byte-identical `input` and `target`. Any missing or
+rejected view quarantines the whole group; partial groups are never published.
+
+Quarantined groups: {statistics['quarantined_group_count']:,}. They remain listed
+in `metadata/audit/quarantined_groups.jsonl` and were not retried merely to fill a
+quota. Reasons:
+
+{quarantine_lines or '- none'}
+
+The staging audit and independent replay check signed group identity, exact six
+cameras/three roles, all logical paths and PNGs, content hashes, no-op equality,
+visible non-equality, metadata provenance hashes, and train/val scene isolation.
+Latest independent status: `{audit_status}` with {candidate_count:,} candidates.
+
+Re-run the independent audit with:
+
+```bash
+driveharm sixcam-strict-audit --dataset-root {destination} \\
+  --output-root <new-audit-directory> --workers 32
+```
+
+## Production and resume
+
+The production invocation was:
+
+```bash
+{run_command}
+```
+
+The renderer and controller are resume-safe: re-run the same command with the
+same work root. Signed completed shards are validated and reused; failed or
+incomplete shards alone are scheduled again. Publication is built in a sibling
+staging directory, fully audited there, and activated with an atomic rename.
+"""
+
+
 def audit_strict_sixcam_release(
     dataset_root: Path,
     output_root: Path,
@@ -1044,6 +1409,85 @@ def audit_strict_sixcam_release(
     errors: list[dict[str, Any]] = []
     scenes: dict[str, set[str]] = {"train": set(), "val": set()}
     group_ids: set[str] = set()
+    metadata_root = dataset_root / "metadata"
+    for name in ("source_index", "receipts", "audit", "reports"):
+        path = metadata_root / name
+        if not path.is_dir():
+            errors.append({"metadata": str(path), "errors": ["required_directory_missing"]})
+    for split in ("train", "val"):
+        source_index = metadata_root / "source_index" / split
+        group_manifest = metadata_root / f"{split}_groups.jsonl"
+        has_groups = group_manifest.is_file() and group_manifest.stat().st_size > 0
+        required = {
+            "summary.json",
+            "source_index.jsonl",
+            "groups.jsonl",
+            "baseline_jobs.jsonl",
+            "visible_backfill_jobs.jsonl",
+        }
+        observed = {
+            path.name for path in source_index.iterdir() if path.is_file()
+        } if source_index.is_dir() else set()
+        if has_groups and not required <= observed:
+            errors.append(
+                {
+                    "metadata": str(source_index),
+                    "errors": ["source_index_incomplete"],
+                    "missing": sorted(required - observed),
+                }
+            )
+    provenance_manifest = metadata_root / "receipts/provenance_manifest.json"
+    if provenance_manifest.is_file():
+        try:
+            provenance = read_json(provenance_manifest)
+            entries = provenance.get("entries") or []
+            if (
+                provenance.get("status") != "complete"
+                or int(provenance.get("entry_count", -1)) != len(entries)
+            ):
+                raise ValueError("invalid provenance manifest header")
+            for entry in entries:
+                path = dataset_root / str(entry.get("published_relative_path") or "")
+                if (
+                    not path.is_file()
+                    or path.is_symlink()
+                    or sha256_file(path) != entry.get("sha256")
+                    or path.stat().st_size != int(entry.get("size_bytes", -1))
+                ):
+                    raise ValueError(f"provenance entry mismatch: {path}")
+        except Exception as exception:
+            errors.append(
+                {
+                    "metadata": str(provenance_manifest),
+                    "errors": [f"provenance_manifest_invalid: {exception}"],
+                }
+            )
+    else:
+        errors.append(
+            {
+                "metadata": str(provenance_manifest),
+                "errors": ["provenance_manifest_missing"],
+            }
+        )
+    release_summary = metadata_root / "reports/release_summary.json"
+    if not release_summary.is_file():
+        errors.append(
+            {"metadata": str(release_summary), "errors": ["release_summary_missing"]}
+        )
+    readme = dataset_root / "README.md"
+    readme_text = readme.read_text(encoding="utf-8") if readme.is_file() else ""
+    required_readme_terms = (
+        "18 flat RGB PNG files",
+        "CAM_FRONT_RIGHT",
+        "Visible edited camera views",
+        "Checkpoint SHA-256",
+        "Exact asset-manifest SHA-256",
+        "sixcam-strict-audit",
+        "resume-safe",
+        "metadata/audit/quarantined_groups.jsonl",
+    )
+    if any(term not in readme_text for term in required_readme_terms):
+        errors.append({"metadata": str(readme), "errors": ["readme_incomplete"]})
     for split in ("train", "val"):
         manifest = dataset_root / "metadata" / f"{split}_groups.jsonl"
         for row in iter_jsonl(manifest.resolve(strict=True)):
@@ -1056,6 +1500,8 @@ def audit_strict_sixcam_release(
                 or not _signed_row(row, "record_sha256")
             ):
                 group_errors.append("invalid_or_duplicate_group_binding")
+            if (row.get("review") or {}).get("status") != "accepted":
+                group_errors.append("group_review_not_accepted")
             group_ids.add(group_id)
             scenes[split].add(str(row.get("scene_name") or ""))
             identity = row.get("group_identity") or {}
@@ -1116,6 +1562,27 @@ def audit_strict_sixcam_release(
                     for role in ROLES
                 ):
                     group_errors.append("role_evidence_incomplete")
+                for role in ROLES:
+                    source = roles[role]
+                    if source.get("source_kind") == "accepted_nusc_pair":
+                        evidence = source.get("evidence") or {}
+                        production_metadata = evidence.get("production_metadata") or {}
+                        if (
+                            not evidence.get("sample_id")
+                            or not evidence.get("combination_id")
+                            or not evidence.get("production_record")
+                            or not evidence.get("authority")
+                            or any(
+                                not production_metadata.get(key)
+                                for key in (
+                                    "manifest",
+                                    "manifest_sha256",
+                                    "row_sha256",
+                                    "line_number",
+                                )
+                            )
+                        ):
+                            group_errors.append("accepted_source_lineage_incomplete")
                 if view.get("no_op") is True:
                     if view.get("visible") is not False or hashes["input"] != hashes["target"]:
                         group_errors.append("invalid_no_op")
@@ -1123,6 +1590,9 @@ def audit_strict_sixcam_release(
                     group_errors.append("invalid_visible_edit")
                 for role in ROLES:
                     filename = f"{group_id}__{view['camera_name']}__{role}.png"
+                    expected_relative_path = f"{split}/{filename}"
+                    if roles[role].get("published_relative_path") != expected_relative_path:
+                        group_errors.append("published_role_path_mismatch")
                     expected_names[split].add(filename)
                     logical.append((dataset_root / split / filename, hashes[role]))
             if len(views) != 6:
@@ -1264,6 +1734,9 @@ def publish_strict_sixcam_release(
     receipt_root: Path,
     baseline_result_paths: Sequence[Path] = (),
     visible_result_paths: Sequence[Path] = (),
+    receipt_paths: Sequence[Path] = (),
+    report_paths: Sequence[Path] = (),
+    production_command: str | None = None,
     selection_path: Path | None = None,
     materialize: str = "hardlink",
     replace: bool = False,
@@ -1309,6 +1782,8 @@ def publish_strict_sixcam_release(
     if not records:
         raise ValueError("strict publication resolved no complete groups")
     records.sort(key=lambda row: (row["split"], row["group_id"]))
+    _bind_strict_published_paths(records)
+    statistics = _strict_release_statistics(records, quarantined)
     destination = destination.resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
     staging = destination.parent / f".{destination.name}.staging.{os.getpid()}"
@@ -1365,21 +1840,32 @@ def publish_strict_sixcam_release(
                 (row for row in records if row["split"] == split),
             )
         atomic_jsonl(staging / "metadata/audit/quarantined_groups.jsonl", quarantined)
+        provenance = _stage_strict_provenance(
+            staging=staging,
+            index_roots=index_roots,
+            baseline_result_paths=baseline_result_paths,
+            visible_result_paths=visible_result_paths,
+            receipt_paths=receipt_paths,
+            report_paths=report_paths,
+        )
+        atomic_json(staging / "metadata/reports/release_summary.json", statistics)
         (staging / "README.md").write_text(
-            "# DriveHarm strict synchronized six-camera release\n\n"
-            f"Groups: {len(records):,} (train "
-            f"{sum(row['split'] == 'train' for row in records):,}, val "
-            f"{sum(row['split'] == 'val' for row in records):,}).\n\n"
-            "Every group contains exactly six nuScenes ring cameras and three roles "
-            "(`gt`, `input`, `target`), for 18 flat PNG files. Group identity binds "
-            "the official split, scene, sample token, STORM context, global asset "
-            "union, instance/PLY identities, and STORM/CVAC/DCN checkpoint hashes. "
-            "Invisible views are explicit byte-identical `input=target` no-ops.\n",
+            _strict_release_readme(
+                destination, statistics, None, production_command
+            ),
             encoding="utf-8",
         )
         audited = audit_strict_sixcam_release(staging, audit_root, workers)
         if audited["status"] != "pass":
             raise RuntimeError("strict staging audit failed")
+        release_report = {**statistics, "audit": audited}
+        atomic_json(staging / "metadata/reports/release_summary.json", release_report)
+        (staging / "README.md").write_text(
+            _strict_release_readme(
+                destination, statistics, audited, production_command
+            ),
+            encoding="utf-8",
+        )
         backup: Path | None = None
         if destination.exists():
             if not replace:
@@ -1411,6 +1897,8 @@ def publish_strict_sixcam_release(
         "selection": str(selection_path.resolve()) if selection_path else None,
         "previous_release": str(backup) if backup else None,
         "audit": read_json(destination / "metadata/audit/summary.json"),
+        "statistics": statistics,
+        "provenance_entry_count": provenance["entry_count"],
     }
     atomic_json(receipt_root / "publish.json", summary)
     atomic_jsonl(receipt_root / "quarantined_groups.jsonl", quarantined)

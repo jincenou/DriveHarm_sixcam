@@ -35,6 +35,10 @@ class SixCameraReleaseTests(unittest.TestCase):
                 "cvac": "b" * 64,
                 "dcn": "c" * 64,
             }
+            production_record = root / "production-record.json"
+            production_record.write_text("{}\n", encoding="utf-8")
+            production_manifest = root / "production-metadata.jsonl"
+            production_manifest.write_text("{}\n", encoding="utf-8")
             asset = {
                 "global_uid": "asset-one",
                 "obj_id": "obj-one",
@@ -91,8 +95,13 @@ class SixCameraReleaseTests(unittest.TestCase):
                     "content_sha256": hashes,
                     "lineage_status": "complete",
                     "authority": {"row_sha256": "f" * 64},
-                    "production_metadata": {"row_sha256": "1" * 64},
-                    "production_record": None,
+                    "production_metadata": {
+                        "line_number": 1,
+                        "manifest": str(production_manifest),
+                        "manifest_sha256": sha256_file(production_manifest),
+                        "row_sha256": "1" * 64,
+                    },
+                    "production_record": str(production_record),
                     "quality_gate_pass": True,
                 }
                 row["record_sha256"] = canonical_sha256(row)
@@ -190,7 +199,17 @@ class SixCameraReleaseTests(unittest.TestCase):
             manifest = json.loads(
                 (destination / "metadata/train_groups.jsonl").read_text()
             )
+            self.assertEqual(manifest["review"]["status"], "accepted")
             for view in manifest["views"]:
+                for role in ("gt", "input", "target"):
+                    expected = (
+                        f"train/{manifest['group_id']}__{view['camera_name']}__"
+                        f"{role}.png"
+                    )
+                    self.assertEqual(
+                        view["role_sources"][role]["published_relative_path"],
+                        expected,
+                    )
                 if view["no_op"]:
                     input_path = destination / "train" / (
                         f"{manifest['group_id']}__{view['camera_name']}__input.png"
@@ -199,6 +218,18 @@ class SixCameraReleaseTests(unittest.TestCase):
                         f"{manifest['group_id']}__{view['camera_name']}__target.png"
                     )
                     self.assertTrue(input_path.samefile(target_path))
+            self.assertTrue(
+                (destination / "metadata/source_index/train/source_index.jsonl").is_file()
+            )
+            self.assertTrue(
+                (destination / "metadata/receipts/provenance_manifest.json").is_file()
+            )
+            self.assertTrue(
+                (destination / "metadata/reports/release_summary.json").is_file()
+            )
+            readme = (destination / "README.md").read_text(encoding="utf-8")
+            self.assertIn("Visible edited camera views", readme)
+            self.assertIn("sixcam-strict-audit", readme)
             audited = audit_strict_sixcam_release(
                 destination, root / "independent-audit"
             )

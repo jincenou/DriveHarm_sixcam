@@ -284,6 +284,13 @@ def parser() -> argparse.ArgumentParser:
     strict_release.add_argument(
         "--visible-results", type=Path, action="append", default=[]
     )
+    strict_release.add_argument(
+        "--receipt", type=Path, action="append", default=[]
+    )
+    strict_release.add_argument(
+        "--report", type=Path, action="append", default=[]
+    )
+    strict_release.add_argument("--production-command")
     strict_release.add_argument("--selection", type=Path)
     strict_release.add_argument("--destination", type=Path, required=True)
     strict_release.add_argument("--receipt-root", type=Path, required=True)
@@ -445,6 +452,9 @@ def main() -> int:
             receipt_root=args.receipt_root,
             baseline_result_paths=args.baseline_results,
             visible_result_paths=args.visible_results,
+            receipt_paths=args.receipt,
+            report_paths=args.report,
+            production_command=args.production_command,
             selection_path=args.selection,
             materialize=args.materialize,
             replace=args.replace,

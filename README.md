@@ -432,6 +432,21 @@ routing, separate baseline/visible shard policies, and independent root audit.
 
 ## Verified reference release
 
+### Full strict six-camera release (2026-09-14)
+
+The full resume-safe production completed and atomically published 38,445
+strict groups (32,591 train and 5,854 validation), or 692,010 logical PNGs, to
+`/mnt/ojc/workplace2/dataset/nusc_pair_6cam`. There are 39,535 genuinely edited
+camera views and 191,135 byte-identical visibility no-ops. Staging, independent
+formal-path, and post-cleanup audits each passed with zero candidates and zero
+train/validation scene overlap. The publisher now ships self-contained
+`source_index`, `receipts`, `audit`, and `reports` metadata, an expanded dataset
+README, portable published role paths, and complete combination/production
+lineage. Existing pairs without complete signed lineage quarantine their whole
+group. See `reports/full_sixcam_production_final_20260914.md` for counts,
+checkpoint/manifest hashes, rejection reasons, cleanup, and reproduction
+evidence.
+
 The implementation preserves the policies used for
 `/mnt/ojc/workplace2/dataset/nusc_pair/train`: 51,132 triplets from 616 official
 train scenes, with all 153,396 images decoded and hash-checked after release.

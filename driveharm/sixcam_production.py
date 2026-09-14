@@ -120,6 +120,12 @@ async def run_strict_sixcam_production(
         receipt_root=receipt_root,
         baseline_result_paths=baseline_results,
         visible_result_paths=visible_records,
+        receipt_paths=[
+            state_path,
+            profiles["train"],
+            profiles["val"],
+            render_contract,
+        ],
         materialize="hardlink",
         replace=False,
         workers=publish_workers,
